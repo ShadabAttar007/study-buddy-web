@@ -3,25 +3,20 @@ import pytesseract
 import pymupdf as fitz
 from PIL import Image
 from google import genai
+from google.genai import errors
 import io
 import os
 import time
+import html
 import platform
 from datetime import datetime
 from dotenv import load_dotenv
 
-# =============================
-# LOAD ENV
-# =============================
 load_dotenv()
 
-# =============================
-# CONFIG
-# =============================
 if platform.system() == "Windows":
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-# Load API key: .env (local) OR Streamlit secrets (cloud)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     try:
@@ -29,32 +24,25 @@ if not GOOGLE_API_KEY:
     except Exception:
         GOOGLE_API_KEY = None
 
-GEMINI_MODEL = "gemini-3.6-flash"  # primary
-FALLBACK_MODELS = ["gemini-flash-latest", "gemini-pro-latest", "gemini-3.6-flash"]
+FALLBACK_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+]
 GITHUB_LINK = "https://github.com/ShadabAttar007"
 
-# =============================
-# PAGE CONFIG
-# =============================
 st.set_page_config(page_title="AI Study Buddy", page_icon="🚀", layout="wide")
 
-# =============================
-# API KEY CHECK
-# =============================
 if not GOOGLE_API_KEY:
     st.error("⚠️ GOOGLE_API_KEY not found. Add it to `.env` locally or to Streamlit Secrets on cloud.")
     st.stop()
 
-# =============================
-# GEMINI CLIENT
-# =============================
+
 @st.cache_resource
 def get_gemini_client():
     return genai.Client(api_key=GOOGLE_API_KEY)
 
-# =============================
-# SESSION STATE
-# =============================
+
 defaults = {
     "subjects": {},
     "total_quizzes": 0,
@@ -67,9 +55,7 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# =============================
-# CSS
-# =============================
+# ---- CSS (unchanged) ----
 st.markdown("""
 <style>
     .stApp {
@@ -143,49 +129,49 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # =============================
 # HELPERS
 # =============================
-import time
-
-# List of models to try, from newest to older
-FALLBACK_MODELS = [
-    "gemini-3.6-flash",   # Your current model
-    "gemini-3.5-flash",   # Next best option
-    "gemini-2.5-flash",   # A stable fallback
-]
-
 def call_gemini(prompt, max_retries=3):
-    """Try multiple models with retries to handle 503 high-demand errors."""
+    """Returns text or raises RuntimeError, so errors never get saved as content."""
     last_error = None
-    
     for model in FALLBACK_MODELS:
         for attempt in range(max_retries):
             try:
-                client = get_gemini_client()
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt
+                response = get_gemini_client().models.generate_content(
+                    model=model, contents=prompt
                 )
-                return response.text if response.text else "No response."
-                
-            except Exception as e:
-                last_error = str(e)
-                
-                # If the model doesn't exist, skip to the next one immediately
-                if "404" in last_error or "not found" in last_error.lower():
-                    break 
-                
-                # If the model is just busy (503), wait and retry this same model
-                if "503" in last_error or "UNAVAILABLE" in last_error:
-                    if attempt < max_retries - 1:
-                        time.sleep(3 * (attempt + 1)) # Wait 3s, 6s...
-                        continue
-                
-                # For any other error, stop trying
+                if response.text:
+                    return response.text
+                last_error = "Model returned an empty response."
                 break
-                
-    return f"⚠️ All models are busy or unavailable. Please try again in a moment."
+            except errors.APIError as e:
+                last_error = f"{e.code}: {e.message}"
+                if e.code == 404:
+                    break
+                if e.code in (429, 500, 503):
+                    if attempt < max_retries - 1:
+                        time.sleep(3 * (attempt + 1))
+                        continue
+                    break
+                raise RuntimeError(last_error)
+            except Exception as e:
+                raise RuntimeError(str(e))
+    raise RuntimeError(f"All models are busy or unavailable. Last error: {last_error}")
+
+
+def build_tutor_prompt(history, question, max_turns=10):
+    recent = history[-max_turns * 2:]
+    convo = "\n".join(
+        f"{'Student' if m['role'] == 'user' else 'Tutor'}: {m['content']}"
+        for m in recent
+    )
+    return (
+        "You are a helpful AI tutor. Continue the conversation below and "
+        "answer the student's latest question.\n\n"
+        f"{convo}\n\nStudent: {question}\nTutor:"
+    )
 
 
 def extract_text(uploaded_file):
@@ -194,13 +180,20 @@ def extract_text(uploaded_file):
         file_ext = uploaded_file.name.rsplit(".", 1)[-1].lower()
 
         if file_ext == "txt":
-            return file_bytes.decode("utf-8")
+            return file_bytes.decode("utf-8", errors="replace")
 
         elif file_ext == "pdf":
             doc = fitz.open(stream=file_bytes, filetype="pdf")
-            text = "\n".join([page.get_text() for page in doc])
+            pages = []
+            for page in doc:
+                text = page.get_text()
+                if not text.strip():  # scanned page -> OCR
+                    pix = page.get_pixmap(dpi=200)
+                    img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    text = pytesseract.image_to_string(img)
+                pages.append(text)
             doc.close()
-            return text
+            return "\n".join(pages)
 
         else:
             img = Image.open(io.BytesIO(file_bytes))
@@ -220,6 +213,7 @@ def get_greeting():
     elif 17 <= h < 21:
         return "Good Evening"
     return "Good Night"
+
 
 # =============================
 # SIDEBAR
@@ -260,7 +254,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown(f"### {get_greeting()}, {st.session_state.profile_name}!")
+st.markdown(f"### {get_greeting()}, {html.escape(st.session_state.profile_name)}!")
 st.caption("What would you like to learn today?")
 st.divider()
 
@@ -273,22 +267,18 @@ with c1:
     if st.button("⬆️\n\nUpload\nMaterial\n\nPDF, TXT, IMG"):
         st.session_state.active_tool = "upload"
         st.rerun()
-
 with c2:
     if st.button("🧠\n\nAsk AI\nTutor\n\nGet Answers"):
         st.session_state.active_tool = "tutor"
         st.rerun()
-
 with c3:
     if st.button("📝\n\nGenerate\nNotes\n\nSmart Notes"):
         st.session_state.active_tool = "notes"
         st.rerun()
-
 with c4:
     if st.button("❓\n\nCreate\nQuiz\n\nMCQs"):
         st.session_state.active_tool = "quiz"
         st.rerun()
-
 with c5:
     if st.button("🃏\n\nCreate\nFlashcards\n\nRevision"):
         st.session_state.active_tool = "flashcards"
@@ -297,11 +287,10 @@ with c5:
 st.divider()
 
 # =============================
-# DYNAMIC MODULES
+# MODULES
 # =============================
 tool = st.session_state.active_tool
 
-# ---------- HOME ----------
 if tool == "home":
     st.subheader("📁 Recent Materials")
     if st.session_state.subjects:
@@ -311,7 +300,6 @@ if tool == "home":
     else:
         st.info("No materials yet. Click **Upload** above to get started.")
 
-# ---------- UPLOAD ----------
 elif tool == "upload":
     st.subheader("📤 Upload Material")
     subj = st.text_input("Subject Name (e.g., Biology)")
@@ -323,30 +311,31 @@ elif tool == "upload":
                 text = extract_text(file)
 
             if text and text.strip():
-                with st.spinner("AI is generating your notes..."):
-                    notes = call_gemini(
-                        f"Create comprehensive study notes for the following material:\n\n{text[:15000]}"
-                    )
-                st.session_state.subjects[subj] = {"Notes": notes}
-                st.success(f"✅ Notes for '{subj}' created!")
-                st.session_state.active_tool = "notes"
-                st.rerun()
-            else:
+                try:
+                    with st.spinner("AI is generating your notes..."):
+                        notes = call_gemini(
+                            f"Create comprehensive study notes for the following material:\n\n{text[:15000]}"
+                        )
+                except RuntimeError as e:
+                    st.error(f"⚠️ {e}")
+                else:
+                    st.session_state.subjects[subj] = {"Notes": notes}
+                    st.success(f"✅ Notes for '{subj}' created!")
+                    st.session_state.active_tool = "notes"
+                    st.rerun()
+            elif text is not None:
                 st.error("❌ Text extraction failed or file is empty.")
         else:
             st.warning("Please enter a subject name and upload a file.")
 
-# ---------- TUTOR ----------
 elif tool == "tutor":
     st.subheader("🧠 AI Tutor")
 
     for msg in st.session_state.chat_history:
         cls = "user-msg" if msg["role"] == "user" else "bot-msg"
         icon = "🧑‍🎓" if msg["role"] == "user" else "🤖"
-        st.markdown(
-            f'<div class="{cls}">{icon} {msg["content"]}</div>',
-            unsafe_allow_html=True
-        )
+        safe = html.escape(msg["content"]).replace("\n", "<br>")
+        st.markdown(f'<div class="{cls}">{icon} {safe}</div>', unsafe_allow_html=True)
 
     user_q = st.text_area("Ask anything...", key="tutor_input")
 
@@ -354,21 +343,21 @@ elif tool == "tutor":
     with b1:
         if st.button("Send"):
             if user_q.strip():
-                st.session_state.chat_history.append(
-                    {"role": "user", "content": user_q}
-                )
-                with st.spinner("Thinking..."):
-                    resp = call_gemini(user_q)
-                st.session_state.chat_history.append(
-                    {"role": "assistant", "content": resp}
-                )
-                st.rerun()
+                try:
+                    with st.spinner("Thinking..."):
+                        prompt = build_tutor_prompt(st.session_state.chat_history, user_q)
+                        resp = call_gemini(prompt)
+                except RuntimeError as e:
+                    st.error(f"⚠️ {e}")
+                else:
+                    st.session_state.chat_history.append({"role": "user", "content": user_q})
+                    st.session_state.chat_history.append({"role": "assistant", "content": resp})
+                    st.rerun()
     with b2:
         if st.button("🗑️ Clear Chat"):
             st.session_state.chat_history = []
             st.rerun()
 
-# ---------- NOTES ----------
 elif tool == "notes":
     st.subheader("📚 My Notes")
     if not st.session_state.subjects:
@@ -378,7 +367,6 @@ elif tool == "notes":
             with st.expander(f"📁 {subj}", expanded=False):
                 st.markdown(data["Notes"])
 
-# ---------- QUIZ ----------
 elif tool == "quiz":
     st.subheader("📝 Quiz Generator")
     subjects = list(st.session_state.subjects.keys())
@@ -386,17 +374,24 @@ elif tool == "quiz":
     if subjects:
         sel = st.selectbox("Pick Subject", subjects)
         if st.button("Generate Quiz"):
-            with st.spinner("Creating quiz..."):
-                resp = call_gemini(
-                    f"Create 5 multiple-choice questions with correct answers based on:\n\n"
-                    f"{st.session_state.subjects[sel]['Notes'][:5000]}"
-                )
-            st.markdown(resp)
-            st.session_state.total_quizzes += 1
+            try:
+                with st.spinner("Creating quiz..."):
+                    resp = call_gemini(
+                        f"Create 5 multiple-choice questions with correct answers based on:\n\n"
+                        f"{st.session_state.subjects[sel]['Notes'][:5000]}"
+                    )
+            except RuntimeError as e:
+                st.error(f"⚠️ {e}")
+            else:
+                st.session_state.subjects[sel]["Quiz"] = resp
+                st.session_state.total_quizzes += 1
+
+        saved = st.session_state.subjects[sel].get("Quiz")
+        if saved:
+            st.markdown(saved)
     else:
         st.warning("Upload material first.")
 
-# ---------- FLASHCARDS ----------
 elif tool == "flashcards":
     st.subheader("🃏 Flashcards")
     subjects = list(st.session_state.subjects.keys())
@@ -404,13 +399,21 @@ elif tool == "flashcards":
     if subjects:
         sel = st.selectbox("Pick Subject", subjects)
         if st.button("Generate Cards"):
-            with st.spinner("Creating flashcards..."):
-                resp = call_gemini(
-                    f"Create 5 question-and-answer flashcards based on:\n\n"
-                    f"{st.session_state.subjects[sel]['Notes'][:5000]}"
-                )
-            st.markdown(resp)
-            st.session_state.total_flashcards += 1
+            try:
+                with st.spinner("Creating flashcards..."):
+                    resp = call_gemini(
+                        f"Create 5 question-and-answer flashcards based on:\n\n"
+                        f"{st.session_state.subjects[sel]['Notes'][:5000]}"
+                    )
+            except RuntimeError as e:
+                st.error(f"⚠️ {e}")
+            else:
+                st.session_state.subjects[sel]["Flashcards"] = resp
+                st.session_state.total_flashcards += 1
+
+        saved = st.session_state.subjects[sel].get("Flashcards")
+        if saved:
+            st.markdown(saved)
     else:
         st.warning("Upload material first.")
 
