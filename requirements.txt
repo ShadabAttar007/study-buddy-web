@@ -1,0 +1,6 @@
+streamlit
+pytesseract
+pymupdf
+pillow
+google-genai>=1.16.1
+python-dotenv
